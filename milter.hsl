@@ -1,0 +1,394 @@
+class Milter
+{
+    private $conf_timeout = 5;
+    private $conf_timeout_eod = 5;
+
+    private $host = none;
+    private $port = none;
+    private $senderip = none;
+    private $senderport = none;
+    private $senderptr = none;
+    private $senderhelo = none;
+    private $recipients = none;
+    private $transactionid = none;
+    private $mail = none;
+
+    private $responses = [];
+    private $res = [];
+
+    private $action = "none";
+
+    constructor($opts, $senderip, $senderport, $senderptr, $senderhelo, $sender, $recipients, $transactionid, $mail)
+    {
+        $this->host = $opts["host"] ?? "";
+        $this->port = $opts["port"] ?? 0;
+        $this->timeout = number($opts["timeout"] ?? $this->conf_timeout);
+        $this->timeout_eod = number($opts["timeout_eod"] ?? $this->conf_timeout_eod);
+        $this->senderip = $senderip;
+        $this->senderport = $senderport;
+        $this->senderptr = $senderptr;
+        $this->senderhelo = $senderhelo;
+        $this->sender = $sender;
+        $this->recipients = $recipients;
+        $this->transactionid = $transactionid;
+        $this->mail = $mail;
+
+        if($this->milter_v6()) {
+            $this->valueModification();
+            $this->takeActions();
+        }
+    }
+
+    // return header value first matched
+    function getHeaderValue($field)
+    {
+        foreach($this->res as $r) {
+            if($r["payload"]["header"] == $field) {
+                return $r["payload"]["value"];
+            }
+        }
+        return none;
+    }
+
+    // return none, discard, reject, setreply, quarantine, tempfail
+    function getAction()
+    {
+        return $this->action;
+    }
+
+    // return values if setreply was triggered.
+    function getReply()
+    {
+        $arr = array_find(function ($x) { return $x["r"] == "y"; }, $this->res);
+
+        // 5.7.1 Service unavailable
+        // $enhanced = [5,7,1], $reason = "Service unavailable"
+        $reason = str_split($arr["payload"]["text"], " ", 2)[1];
+        $enhanced = str_split(str_split($arr["payload"]["text"], " ")[0], ".");
+        return ["reason" => $reason, "reply_codes" => ["code" => $arr["payload"]["smtpcode"], "enhanced" => $enhanced]];
+    }
+
+
+    private function milter_v6()
+    {
+        $this->responses = [];
+        $headers = $this->milter_getHeaders();
+        $body = str_replace("\x00", "", $this->mail->getBody(["decode" => false]));
+
+        $socket = Socket(Socket::AF($this->host), "SOCK_STREAM");
+        if (!$socket->settimeout($this->timeout)) return false;
+        if (!$socket->connect($this->host, number($this->port))) {
+            syslog("warning", "milter_v2: connection failed to %s:%s" % [$this->host, $this->port]);
+            return false;
+        }
+
+
+        // milter v6 negotiation
+        $this->milter_send($socket, "O", pack("NNN", 6, 0x1 | 0x2 | 0x10 | 0x20, 0x1ff));
+        if (!$this->milter_read($socket, $this->milter_expect_O)) return false;
+
+        // Connection : Cj hostname {daemon_name} hostname v Halon {client_addr} remote_ip
+        $macro_arr = ["j" => gethostname(),
+                      "{daemon_name}" => gethostname(),
+                      "v" => "Halon",
+                      "{client_addr}" => $this->senderip];
+        $this->milter_send($socket, "C",
+            $this->senderptr . "\x00".
+            (str_find($this->senderip, ":") != -1 ? "6" : "4").
+            pack("n", $this->senderport).
+            $this->senderip."\x00",
+            $macro_arr);
+        if (!$this->milter_read($socket, $this->milter_expect_c)) return false;
+
+
+        // HELO
+        $this->milter_send($socket, "H", $this->senderhelo."\x00", []);
+        if (!$this->milter_read($socket, $this->milter_expect_c)) return false;
+
+        // MAIL
+        $macro_arr = ["{mail_addr}" => $this->sender,
+                      "{mail_host}" => $this->senderip,
+                      "{mail_mailer}" => "smtp"];
+        $this->milter_send($socket, "M", $this->sender."\x00", $macro_arr);
+        if (!$this->milter_read($socket, $this->milter_expect_c)) return false;
+
+        // RCPT
+        foreach ($this->recipients as $r) {
+            $macro_arr = ["{rcpt_addr}" => $r,
+                          "{rcpt_host}" => "",
+                          "{rcpt_mailer}" => "smtp"];
+            $this->milter_send($socket, "R", $r."\x00", $macro_arr);
+            if (!$this->milter_read($socket, $this->milter_expect_c)) return false;
+        }
+
+        // DATA related
+        //$macro_arr = ["i" => $this->transactionid];
+        //if (!$socket->settimeout($this->timeout_eod)) return false;
+        //$this->milter_send($socket, "T", "", $macro_arr);
+
+
+        // HEADER
+        foreach ($headers as $h) {
+            $macro_arr = ["i" => $this->transactionid];
+            $this->milter_send($socket, "L", $h["name"]."\x00".$h["value"]."\x00", $macro_arr);
+            if (!$this->milter_read($socket, $this->milter_expect_c)) return false;
+        }
+
+        // End of HEADER
+        $macro_arr = ["i" => $this->transactionid];
+        $this->milter_send($socket, "N", "\x00", $macro_arr);
+        if (!$this->milter_read($socket, $this->milter_expect_c)) return false;
+
+        // BODY
+        $macro_arr = ["i" => $this->transactionid];
+        $pos = 0;
+        $len = 65530;
+        $body_len = length($body);
+        while($pos <= $body_len) {
+            $body_chunk = str_slice($body, $pos, $len);
+            $this->milter_send($socket, "B", $body_chunk, $macro_arr);
+            if (!$this->milter_read($socket, $this->milter_expect_c)) return false;
+            $pos += $len;
+        }
+
+        // End of Body
+        $macro_arr = ["i" => $this->transactionid];
+        if (!$socket->settimeout($this->timeout_eod)) return false;
+        $this->milter_send($socket, "E", "", $macro_arr);
+        //if (!$this->milter_read($socket, $this->milter_expect_c)) return false;
+
+        // parse responses
+        while (true)
+        {
+            $data = $this->milter_read($socket, $this->milter_parse);
+            if (!$data) return false;
+            $this->responses[] = $data;
+            if (in_array($data["r"], ["a", "c", "t", "r", "d", "y"]))
+                break;
+        }
+
+        // QUIT
+        $this->milter_send($socket, "Q");
+        $socket->close();
+
+        return true;
+
+    }
+
+
+    private function milter_getHeaders()
+    {
+        $hIndex = [];
+        $headers = [];
+        foreach ($this->mail->getHeaderNames() as $h) {
+            $v = $this->mail->getHeader($h, ["field" => true, "index" => $hIndex[$h]++]);
+            // get original header field name with case sensitive + rstrip
+            $name = str_slice($v, 0, length($h));
+            // get filed body same as Postfix (cut first only 0x20 if body starts with 0x20, if not, send as it is)
+            // 1 << 20: flag for Negotiation command's step
+            $value = str_split($v, ":", 2)[1];
+            $value = str_replace("\x00", "", pcre_replace("^[ ]", "", $value, 1));
+            $value = str_rstrip($value, "\r\n");
+            $headers[] = ["name" => $name, "value" => $value];
+        }
+        return $headers;
+    }
+
+
+    private function milter_send($socket, $cmd, $data = "", $macro_arr = "")
+    {
+        // macro: {length:4bytes}D{command}{macro}0x00
+        // data: {length:4bytes}{command}{data}0x00
+        $macro = "";
+        if(is_array($macro_arr)) {
+            $macro_data = "";
+            foreach($macro_arr as $key => $value) {
+                $macro_data .= $key . "\x00" . $value . "\x00";
+            }
+            $macro = pack("N", 2 + length($macro_data))."D".$cmd.$macro_data;
+        }
+
+        // T is special, if content is empty, send only macro part(DT.....)
+        if($cmd == "T" and $data == "") {
+            return $socket->send($macro);
+        }
+
+        return $socket->send($macro + pack("N", 1 + length($data)).$cmd.$data);
+    }
+
+
+    private function milter_read($socket, $parse)
+    {
+        $data = $socket->recv(4);
+        if (!$data) return;
+        $data = $socket->recv(unpack("N", $data)[0]);
+        if (!$data) return;
+        $payload = $parse($data[0], $data[1:]);
+        if (!is_array($payload)) return;
+        return ["r" => $data[0], "payload" => $payload];
+    }
+
+
+    private function milter_expect_O($r, $data)
+    {
+        if ($r != "O")
+            return;
+        return $this->milter_parse($r, $data);
+    }
+
+    private function milter_expect_c($r, $data)
+    {
+        if ($r != "c")
+            return;
+        return $this->milter_parse($r, $data);
+    }
+
+    private function milter_parse($r, $data)
+    {
+        if ($r == "b")
+        {
+            [$b] = str_split($data, "\x00");
+            return ["buf" => $b];
+        }
+        else if ($r == "m")
+        {
+            [$i, $d] = unpack("Na*", $data);
+            [$n, $v] = str_split($d, "\x00");
+            return ["index" => $i, "name" => $n, "value" => $v];
+        }
+        else if ($r == "h")
+        {
+            [$h, $v] = str_split($data, "\x00");
+            return ["header" => $h, "value" => $v];
+        }
+        else if ($r == "q")
+        {
+            [$r] = str_split($data, "\x00");
+            return ["reason" => $r];
+        }
+        else if ($r == "y")
+        {
+            return ["smtpcode" => $data[0:3], "text" => $data[4:-1]];
+        }
+        else if ($r == "a" or $r == "c" or $r == "r" or $r == "t" or $r == "d")
+        {
+            return [];
+        }
+        else if ($r == "O")
+        {
+            $o = unpack("NNN", $data);
+            return [
+                "version" => $o[0],
+                "actions" => $o[1],
+                "protocol" => $o[2],
+            ];
+        }
+        return [];
+    }
+
+
+    private function fixCRLF($v)
+    {
+        // \r\n -> \n, \r -> \n, \n -> \r\n
+        return str_replace("\n", "\r\n", str_replace("\r", "\n", str_replace("\r\n", "\n", $v)));
+    }
+
+
+    private function valueModification()
+    {
+        $this->res = [];
+        if (!is_array($this->responses)) return;
+
+        foreach ($this->responses as $r) {
+            // add header (addheader)
+            if($r["r"] == "h") {
+                $r["payload"]["value"] = $this->fixCRLF($r["payload"]["value"]);
+            }
+
+            // replace header (tagsubject)
+            else if($r["r"] == "m") {
+                // fix index number for Halon
+                if(is_number($r["payload"]["index"]) and $r["payload"]["index"] > 0) {
+                    $r["payload"]["index"] -= 1;
+                }
+
+                if($r["payload"]["value"] != "") {
+                    // remove last \r\n for setHeader()
+                    $r["payload"]["value"] = str_rstrip($this->fixCRLF($r["payload"]["value"]));
+                }
+            }
+
+            // replace body (replacebody)
+            else if($r["r"] == "b") {
+                $r["payload"]["buf"] = $this->fixCRLF($r["payload"]["buf"]);
+            }
+
+            $this->res[] = $r;
+        }
+    }
+
+
+    private function takeActions()
+    {
+        foreach ($this->res as $r) {
+            // add header (addheader)
+            if($r["r"] == "h") {
+                $header = $r["payload"]["header"];
+                $value = $r["payload"]["value"];
+
+                if($header != "" and $value != "") {
+                    $this->mail->addHeader($header, $value, ["encode" => false]);
+                }
+            }
+
+            // replace header (tagsubject)
+            else if($r["r"] == "m") {
+                $header = $r["payload"]["name"];
+                $value = $r["payload"]["value"];
+                $index = $r["payload"]["index"];
+
+                if(!is_number($index)) {
+                    continue;
+                }
+
+               if($header != "" and $value != "") {
+                   $this->mail->setHeader($header, $value, ["index" => $index, "encode" => false]);
+               }
+           }
+
+           // replace body (replacebody)
+           else if($r["r"] == "b") {
+               $body = $r["payload"]["buf"];
+               if($body != "") {
+                   $this->mail->setBody($body);
+               }
+           }
+
+           /*********
+            * following response code cannot proceeded (Cannot call Accept()/Defer()/Reject()) in this class
+            * // discard (return 250 and not put in queue)
+            * else if($r["r"] == "d") Accept();
+            *
+            * // tempfail
+            * else if($r["r"] == "t") Defer("message deferred");
+            *
+            * // reject or setrply
+            * else if($r["r"] == "r" or $r["r"] == "y") Reject("Message rejected");
+            *
+            * // quarantine (ignore)
+            * else if($r["r"] == "q") {
+            *   // quarantine action
+            * }
+            */
+
+           // store action flag instead
+           else if($r["r"] == "d") $this->action = "discard";
+           else if($r["r"] == "r") $this->action = "reject";
+           else if($r["r"] == "y") $this->action = "setreply";
+           else if($r["r"] == "q") $this->action = "quarantine";
+           else if($r["r"] == "t") $this->action = "tempfail";
+
+           //echo $r;
+        }
+    }
+}
