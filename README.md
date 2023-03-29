@@ -1,4 +1,4 @@
-# Summary
+# Milter
 
 Implementation of the Milter protocol v6 for EOD script.
 Integration tested with clamav-milter, Cloudmark Authority Milter and SAFE/25 (inet socket).
