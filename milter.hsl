@@ -372,7 +372,7 @@ class Milter
             * // tempfail
             * else if($r["r"] == "t") Defer("message deferred");
             *
-            * // reject or setrply
+            * // reject or setreply
             * else if($r["r"] == "r" or $r["r"] == "y") Reject("Message rejected");
             *
             * // quarantine (ignore)
